@@ -3,9 +3,11 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"github.com/beevik/ntp"
 	"io"
+	"net/http"
 	"os/exec"
 	"strconv"
 	"strings"
@@ -33,21 +35,42 @@ var Num = map[string]int{
 }
 
 type Pkt struct {
-	SendAddr string
-	RecvAddr string
-	Syn bool
-	Fin bool
-	Time time.Time
+	Time        int64 `json:"time"`
+	Syn         bool      `json:"syn"`
+	Fin         bool      `json:"fin"`
+	DataLength  int  `json:"data_length"`
+	Source      string    `json:"source"`
+	Destination string    `json:"destination"`
+	Tos         int `json:"tos"`
 }
 
 var tempPkt Pkt
+var tempPkt2 Pkt
+
+var realIp string
 
 var tempIp string
 
 var BaseTime *ntp.Response
 
 func main() {
+	// get IP
+	type Ip struct {
+		IP      string `json:"ip"`
+	}
+	var ipStruct Ip
 	var err error
+	resp,err := http.Get("https://ipinfo.io/")
+	if err != nil{
+		panic(err)
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&ipStruct); err != nil{
+		panic(err)
+	}else{
+		realIp = ipStruct.IP
+	}
+	fmt.Println(realIp)
+
 	BaseTime,err = ntp.QueryWithOptions("time.google.com",ntp.QueryOptions{})
 	if err != nil{
 		panic(err)
@@ -55,18 +78,24 @@ func main() {
 
 	//./pkt-recv -i en0 TCP.SRC_PORT==443 | ./pkt-txt2txt ETHERNET.TYPE==0x0800 | ./pkt-txt2txt TCP.FLAGS==0x002 # SYN
 	//./pkt-recv -i en0 TCP.SRC_PORT==0x1bb | ./pkt-txt2txt ETHERNET.TYPE==0x0800 | ./pkt-txt2txt TCP.FLAGS==0x011 # FIN ACK
-	cmdstr := "pkttools-1.16/pkt-recv -i en0 TCP==443"
+	cmdstr := "pkttools-1.16/pkt-recv -i en0 TCP.SRC_PORT==443"
+	cmdstr2 := "pkttools-1.16/pkt-recv -i en0 TCP.DST_PORT==443"
 	cmd := exec.Command("sh", "-c", cmdstr)
+	cmd2 := exec.Command("sh", "-c", cmdstr2)
 	//cmd := exec.Command("pkttools-1.16/pkt-recv", "-i","en0")
-	runCommand(cmd)
+
+	go func(c *exec.Cmd,temp Pkt) {
+		runCommand(c,&temp)
+	}(cmd2,tempPkt2)
+	runCommand(cmd,&tempPkt)
 }
 
 
-func pktParse(line string){
+func pktParse(line string,temp *Pkt){
 	// パケットが完了している場合は変数を初期化。生成時刻を記録
 	if line[:2] == "--"{
-		tempPkt = Pkt{}
-		tempPkt.Time = time.Now().Add(BaseTime.ClockOffset) //時刻記録
+		temp = &Pkt{}
+		temp.Time = time.Now().Add(BaseTime.ClockOffset).Unix() //時刻記録
 		return
 	}
 	// パケット終了
@@ -74,10 +103,15 @@ func pktParse(line string){
 		// TODO:ここで終了処理
 
 		// SYNでもFINでもないパケットは破棄
-		if !tempPkt.Syn && !tempPkt.Fin{
+		if !temp.Syn && !temp.Fin{
 			return
 		}
-		fmt.Println("SendIP",tempPkt.SendAddr,"RecvIP",tempPkt.RecvAddr,"Status:Syn",tempPkt.Syn,"Status:Fin",tempPkt.Fin,"Time",tempPkt.Time.Unix())
+		j,err := json.Marshal(&temp)
+		if err != nil{
+			panic(err)
+		}
+		fmt.Println(string(j))
+		//fmt.Println("SendIP",temp.Source,"RecvIP",temp.Destination,"Status:Syn",temp.Syn,"Status:Fin",temp.Fin,"Time",temp.Time)
 		return
 	}
 	// IPアドレス 送信元 TODO:ここはDHCPが有効だとローカルIPアドレスになる。
@@ -85,12 +119,19 @@ func pktParse(line string){
 		ips := strings.Split(line[40:52]," ")
 		ip := ""
 		for n,i := range ips{
+			if i == ""{
+				continue
+			}
 			if n != 0{
 				ip += "."
 			}
 			ip += strconv.Itoa(x0to10(i))
 		}
-		tempPkt.SendAddr = ip
+		if ip[:7] == "192.168"{
+			temp.Source = realIp
+		}else{
+			temp.Source = ip
+		}
 		//fmt.Println(ip,line[40:52])
 	}
 	// IPアドレス 送信先
@@ -98,6 +139,9 @@ func pktParse(line string){
 		ips := strings.Split(line[53:58]," ")
 		tempIp = ""
 		for _,i := range ips{
+			if i == ""{
+				continue
+			}
 			if tempIp != ""{
 				tempIp += "."
 			}
@@ -108,25 +152,32 @@ func pktParse(line string){
 	if line[:6] == "000020"{
 		ips := strings.Split(line[8:13]," ")
 		for _,i := range ips{
+			if i == ""{
+				continue
+			}
 			if tempIp != ""{
 				tempIp += "."
 			}
 			tempIp += strconv.Itoa(x0to10(i))
 		}
-		tempPkt.RecvAddr = tempIp
+		if tempIp[:7] == "192.168"{
+			temp.Destination = realIp
+		}else{
+			temp.Destination = tempIp
+		}
 		//fmt.Println(tempIp,line[8:13])
 	}
 	// FLAGS
 	if line[:6] == "000020"{
 		if line[56:58] == "02"{
-			tempPkt.Syn = true
+			temp.Syn = true
 			//log.Println("SYN")
 		}
 		if line[56:58] == "11"{
-			tempPkt.Fin = true
+			temp.Fin = true
 			//log.Println("FIN ACK")
 		}
-		//fmt.Println(tempPkt.Syn,tempPkt.Fin,line[56:58])
+		//fmt.Println(temp.Syn,temp.Fin,line[56:58])
 	}
 	//fmt.Println(line)
 }
@@ -141,7 +192,7 @@ func x0to10 (s string)int{
 	return sum
 }
 
-func runCommand(cmd *exec.Cmd) {
+func runCommand(cmd *exec.Cmd,temp *Pkt) {
 	// stdoutのプロセスを取り出す的な
 	outReader, err := cmd.StdoutPipe()
 	if err != nil {
@@ -161,7 +212,7 @@ func runCommand(cmd *exec.Cmd) {
 	go func(r io.Reader) {
 		scanner := bufio.NewScanner(r)
 		for scanner.Scan() {
-			pktParse(scanner.Text())
+			pktParse(scanner.Text(),temp)
 		}
 	}(outReader2)
 
