@@ -75,8 +75,6 @@ func pktParse(line string, temp *Pkt) {
 	}
 	// パケット終了
 	if end.MatchString(line) {
-		// TODO:ここで終了処理
-
 		// SYNでもFINでもないパケットは破棄
 		if !temp.Syn && !temp.Fin {
 			return
@@ -87,7 +85,6 @@ func pktParse(line string, temp *Pkt) {
 		}
 		// 該当パケットを出力
 		fmt.Println(string(j))
-		//fmt.Println("SendIP",temp.Source,"RecvIP",temp.Destination,"Status:Syn",temp.Syn,"Status:Fin",temp.Fin,"Time",temp.Time)
 		return
 	}
 
@@ -140,7 +137,7 @@ func runCommand(cmd *exec.Cmd, temp *Pkt) {
 		return
 	}
 
-	// ここでstdour1行一行をスキャン
+	// ここでstdour1行1行をスキャン
 	go func(r io.Reader,t *Pkt) {
 		scanner := bufio.NewScanner(r)
 		for scanner.Scan() {
