@@ -7,192 +7,124 @@ import (
 	"fmt"
 	"github.com/beevik/ntp"
 	"io"
-	"net/http"
 	"os/exec"
-	"strconv"
-	"strings"
+	"regexp"
 	"time"
 )
 
-
-var Num = map[string]int{
-	"0": 0,
-	"1": 1,
-	"2": 2,
-	"3": 3,
-	"4": 4,
-	"5": 5,
-	"6": 6,
-	"7": 7,
-	"8": 8,
-	"9": 9,
-	"A": 10,
-	"B": 11,
-	"C": 12,
-	"D": 13,
-	"E": 14,
-	"F": 15,
-}
-
 type Pkt struct {
-	Time        int64 `json:"time"`
-	Syn         bool      `json:"syn"`
-	Fin         bool      `json:"fin"`
-	DataLength  int  `json:"data_length"`
-	Source      string    `json:"source"`
-	Destination string    `json:"destination"`
-	Tos         int `json:"tos"`
+	Time        int64  `json:"time"`
+	Syn         bool   `json:"syn"`
+	Fin         bool   `json:"fin"`
+	DataLength  int    `json:"data_length"`
+	Source      string `json:"source"`
+	Destination string `json:"destination"`
+	Tos         int    `json:"tos"`
 }
 
-var tempPkt Pkt
-var tempPkt2 Pkt
-
-var realIp string
-
-var tempIp string
+var tempSrcPort Pkt
+var tempDstPort Pkt
 
 var BaseTime *ntp.Response
 
+var ipSrc, ipDst, tcpFlags, ipAddr, hex, start, end *regexp.Regexp
+
+var err error
+
 func main() {
-	// get IP
-	type Ip struct {
-		IP      string `json:"ip"`
-	}
-	var ipStruct Ip
-	var err error
-	resp,err := http.Get("https://ipinfo.io/")
-	if err != nil{
+	// 正規表現定義
+	ipSrc = regexp.MustCompile(`IP.SRC_ADDR:`)
+	ipDst = regexp.MustCompile(`IP.DST_ADDR:`)
+	tcpFlags = regexp.MustCompile(`TCP.FLAGS:`)
+
+	// IPアドレス
+	ipAddr = regexp.MustCompile(`([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)`)
+	// 16進数
+	hex = regexp.MustCompile(`(0x[a-fA-F0-9]+)`)
+	// パケット関連
+	start = regexp.MustCompile(`-- ([0-9]+) --`)
+	end = regexp.MustCompile(`==`)
+
+	// TODO:グローバルIPアドレスを取得する。（TODO:インターフェイス見ろよw） os.interface的な
+	// 標準時間を取得
+	BaseTime, err = ntp.QueryWithOptions("time.google.com", ntp.QueryOptions{})
+	if err != nil {
 		panic(err)
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&ipStruct); err != nil{
-		panic(err)
-	}else{
-		realIp = ipStruct.IP
-	}
-	fmt.Println(realIp)
+	fmt.Println("BaseTime:",BaseTime.Time,"Unix",time.Now().Add(BaseTime.ClockOffset).Unix())
+	// キャプチャするコマンドを生成（同じコマンドを実行すればターミナルで再現できるよ）
 
-	BaseTime,err = ntp.QueryWithOptions("time.google.com",ntp.QueryOptions{})
-	if err != nil{
-		panic(err)
-	}
+	cmdSrcStr := "pkttools-1.16/pkt-recv -i en0 TCP.SRC_PORT==443 -a"
+	cmdDstStr := "pkttools-1.16/pkt-recv -i en0 TCP.DST_PORT==443 -a"
+	cmdSrc := exec.Command("sh", "-c", cmdSrcStr)
+	cmdDst := exec.Command("sh", "-c", cmdDstStr)
 
-	//./pkt-recv -i en0 TCP.SRC_PORT==443 | ./pkt-txt2txt ETHERNET.TYPE==0x0800 | ./pkt-txt2txt TCP.FLAGS==0x002 # SYN
-	//./pkt-recv -i en0 TCP.SRC_PORT==0x1bb | ./pkt-txt2txt ETHERNET.TYPE==0x0800 | ./pkt-txt2txt TCP.FLAGS==0x011 # FIN ACK
-	cmdstr := "pkttools-1.16/pkt-recv -i en0 TCP.SRC_PORT==443"
-	cmdstr2 := "pkttools-1.16/pkt-recv -i en0 TCP.DST_PORT==443"
-	cmd := exec.Command("sh", "-c", cmdstr)
-	cmd2 := exec.Command("sh", "-c", cmdstr2)
-	//cmd := exec.Command("pkttools-1.16/pkt-recv", "-i","en0")
-
-	go func(c *exec.Cmd,temp Pkt) {
-		runCommand(c,&temp)
-	}(cmd2,tempPkt2)
-	runCommand(cmd,&tempPkt)
+	// コマンドを実行する。
+	go func(c *exec.Cmd,temp *Pkt) {
+		runCommand(c,temp)
+	}(cmdDst,&tempDstPort)
+	runCommand(cmdSrc, &tempSrcPort)
 }
 
-
-func pktParse(line string,temp *Pkt){
+func pktParse(line string, temp *Pkt) {
 	// パケットが完了している場合は変数を初期化。生成時刻を記録
-	if line[:2] == "--"{
-		temp = &Pkt{}
+	if start.MatchString(line) {
+		*temp = Pkt{Time:-1,Syn:false,Fin:false,DataLength:-1,Source:"",Destination:"",Tos:-1}
 		temp.Time = time.Now().Add(BaseTime.ClockOffset).Unix() //時刻記録
 		return
 	}
 	// パケット終了
-	if line == "=="{
+	if end.MatchString(line) {
 		// TODO:ここで終了処理
 
 		// SYNでもFINでもないパケットは破棄
-		if !temp.Syn && !temp.Fin{
+		if !temp.Syn && !temp.Fin {
 			return
 		}
-		j,err := json.Marshal(&temp)
-		if err != nil{
+		j, err := json.Marshal(&temp)
+		if err != nil {
 			panic(err)
 		}
+		// 該当パケットを出力
 		fmt.Println(string(j))
 		//fmt.Println("SendIP",temp.Source,"RecvIP",temp.Destination,"Status:Syn",temp.Syn,"Status:Fin",temp.Fin,"Time",temp.Time)
 		return
 	}
-	// IPアドレス 送信元 TODO:ここはDHCPが有効だとローカルIPアドレスになる。
-	if line[:6] == "000010"{
-		ips := strings.Split(line[40:52]," ")
-		ip := ""
-		for n,i := range ips{
-			if i == ""{
-				continue
-			}
-			if n != 0{
-				ip += "."
-			}
-			ip += strconv.Itoa(x0to10(i))
+
+	// IPアドレスゾーン
+	// TODO:ここはDHCPが有効だとローカルIPアドレスになる。（誰か置き換えてローカルIP取得して）（FIT.AC.JPだとグローバル降ってるからいいや）
+	// 送信元IPアドレス IP.SRC_ADDR:		136.243.37.214
+	if ipSrc.MatchString(line) {
+		if ipAddr.MatchString(line) {
+			temp.Source = ipAddr.FindString(line)
+			//fmt.Println("SRC IP ADDR:", ipAddr.FindString(line))
 		}
-		if ip[:7] == "192.168"{
-			temp.Source = realIp
-		}else{
-			temp.Source = ip
-		}
-		//fmt.Println(ip,line[40:52])
 	}
-	// IPアドレス 送信先
-	if line[:6] == "000010"{
-		ips := strings.Split(line[53:58]," ")
-		tempIp = ""
-		for _,i := range ips{
-			if i == ""{
-				continue
-			}
-			if tempIp != ""{
-				tempIp += "."
-			}
-			tempIp += strconv.Itoa(x0to10(i))
+	// 送信先IPアドレス IP.DST_ADDR:		192.168.43.55
+	if ipDst.MatchString(line) {
+		if ipAddr.MatchString(line) {
+			temp.Destination = ipAddr.FindString(line)
+			//fmt.Println("DST IP ADDR:", ipAddr.FindString(line))
 		}
-		//fmt.Println(tempIp,line[52:58])
 	}
-	if line[:6] == "000020"{
-		ips := strings.Split(line[8:13]," ")
-		for _,i := range ips{
-			if i == ""{
-				continue
+
+	// フラグゾーン TCP.FLAGS:		0x20がSYN0x11がFIN（FINはFIN ACKで帰ってくるよ）
+	if tcpFlags.MatchString(line) {
+		if hex.MatchString(line) {
+			if hex.FindString(line) == "0x2" {
+				temp.Syn = true
+				//fmt.Println("TCP FLAGS:", "SYN", hex.FindString(line))
+			} else if hex.FindString(line) == "0x11" {
+				temp.Fin = true
+				//fmt.Println("TCP FLAGS:", "FIN", hex.FindString(line))
+			} else {
+				//fmt.Println("TCP FLAGS:", hex.FindString(line))
 			}
-			if tempIp != ""{
-				tempIp += "."
-			}
-			tempIp += strconv.Itoa(x0to10(i))
 		}
-		if tempIp[:7] == "192.168"{
-			temp.Destination = realIp
-		}else{
-			temp.Destination = tempIp
-		}
-		//fmt.Println(tempIp,line[8:13])
 	}
-	// FLAGS
-	if line[:6] == "000020"{
-		if line[56:58] == "02"{
-			temp.Syn = true
-			//log.Println("SYN")
-		}
-		if line[56:58] == "11"{
-			temp.Fin = true
-			//log.Println("FIN ACK")
-		}
-		//fmt.Println(temp.Syn,temp.Fin,line[56:58])
-	}
-	//fmt.Println(line)
 }
 
-
-func x0to10 (s string)int{
-	if len(s) != 2{
-		return 0
-	}
-	sum := Num[s[:1]] * 16
-	sum += Num[s[1:]]
-	return sum
-}
-
-func runCommand(cmd *exec.Cmd,temp *Pkt) {
+func runCommand(cmd *exec.Cmd, temp *Pkt) {
 	// stdoutのプロセスを取り出す的な
 	outReader, err := cmd.StdoutPipe()
 	if err != nil {
@@ -200,7 +132,7 @@ func runCommand(cmd *exec.Cmd,temp *Pkt) {
 	}
 
 	// 読み取れるようにする
-	var bufout  bytes.Buffer
+	var bufout bytes.Buffer
 	outReader2 := io.TeeReader(outReader, &bufout)
 
 	// 実行
@@ -209,12 +141,12 @@ func runCommand(cmd *exec.Cmd,temp *Pkt) {
 	}
 
 	// ここでstdour1行一行をスキャン
-	go func(r io.Reader) {
+	go func(r io.Reader,t *Pkt) {
 		scanner := bufio.NewScanner(r)
 		for scanner.Scan() {
-			pktParse(scanner.Text(),temp)
+			pktParse(scanner.Text(), t)
 		}
-	}(outReader2)
+	}(outReader2,temp)
 
 	// コマンド終了まで待つ
 	err = cmd.Wait()
